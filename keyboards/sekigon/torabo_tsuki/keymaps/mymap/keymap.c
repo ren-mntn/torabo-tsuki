@@ -35,16 +35,27 @@ enum {
 
 static uint16_t typing_timer = 0;
 static bool is_typing_mode = false;
+static bool is_fixed_scroll_mode = false;
 static uint16_t last_keycode = 0;
 static uint16_t current_pressed_key = KC_NO;
 
-// トラックボール移動があったら外部から呼ばれる
+// スクロールモード判定 (momentary DRAG_SCROLL or fixed)
+static bool get_scroll_active(void) {
+    return is_fixed_scroll_mode || (set_scrolling & 1);
+}
+
+// トラックボール移動があったら呼ばれる
 void set_typing_false(void) {
     if (is_typing_mode) {
         is_typing_mode = false;
         if (current_pressed_key != KC_NO) {
             unregister_code16(current_pressed_key);
             current_pressed_key = KC_NO;
+        }
+        // 固定スクロールモードも解除
+        if (is_fixed_scroll_mode) {
+            is_fixed_scroll_mode = false;
+            set_scrolling &= ~(1 << 0);
         }
     }
 }
@@ -330,30 +341,39 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    // DRAG_SCROLL / Encoder keys
-    switch (keycode) {
-        case DRAG_SCROLL:
-            set_scrolling &= ~(1 << 0);
-            set_scrolling |= record->event.pressed ? 1 : 0;
-            return false;
-
-        case TRACKBALL_AS_ENCODER1 ... TRACKBALL_AS_ENCODER2:
-            set_encoder &= ~(1 << (keycode - TRACKBALL_AS_ENCODER1));
-            set_encoder |= record->event.pressed ? (1 << (keycode - TRACKBALL_AS_ENCODER1)) : 0;
-            return false;
+    // Encoder keys (not part of typing/scroll logic)
+    if (keycode >= TRACKBALL_AS_ENCODER1 && keycode <= TRACKBALL_AS_ENCODER2) {
+        set_encoder &= ~(1 << (keycode - TRACKBALL_AS_ENCODER1));
+        set_encoder |= record->event.pressed ? (1 << (keycode - TRACKBALL_AS_ENCODER1)) : 0;
+        return false;
     }
 
-    // Early return for keys not used in typing mode logic
-    if (!((keycode >= KC_A && keycode <= KC_Z) || keycode == KC_BTN1 || keycode == KC_BTN2 ||
+    // 早期リターン: typing/scroll logicで使わないキーはスルー
+    if (!((keycode >= KC_A && keycode <= KC_Z) || keycode == KC_BTN1 || keycode == KC_BTN2 || keycode == DRAG_SCROLL ||
           keycode == KC_LNG1 || keycode == KC_LNG2 || IS_QK_MOD_TAP(keycode) || IS_QK_LAYER_TAP(keycode))) {
         return true;
     }
 
-    // Mouse click handling (BTN1, BTN2)
-    if (keycode == KC_BTN1 || keycode == KC_BTN2) {
+    // マウスクリック（BTN1, BTN2, DRAG_SCROLL）の処理
+    if (keycode == KC_BTN1 || keycode == KC_BTN2 || keycode == DRAG_SCROLL) {
+        // スクロールモード時のBTN1はピンチイン/アウト用のCmd+左クリック
+        if (keycode == KC_BTN1) {
+            if (get_scroll_active()) {
+                if (record->event.pressed) {
+                    register_code(KC_LGUI);
+                } else {
+                    unregister_code(KC_LGUI);
+                }
+                return false;
+            }
+        }
+
         if (record->event.pressed) {
+            // タイピングモード中: BTN1→J, BTN2→L, DRAG_SCROLL→K
             if (is_typing_mode) {
-                uint16_t target_keycode = (keycode == KC_BTN1) ? KC_J : KC_L;
+                uint16_t target_keycode = (keycode == KC_BTN1) ? KC_J :
+                                         (keycode == KC_BTN2) ? KC_L :
+                                         KC_K; // DRAG_SCROLL
                 if (current_pressed_key != KC_NO) {
                     unregister_code16(current_pressed_key);
                 }
@@ -361,22 +381,38 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 register_code16(target_keycode);
                 return false;
             } else {
-                uint16_t target_keycode = (keycode == KC_BTN1) ? KC_J : KC_L;
+                // 通常モード: マウスクリック動作 + 自動補完用の設定
+                if (keycode == DRAG_SCROLL) {
+                    // DRAG_SCROLL: スクロールモードON
+                    set_scrolling |= (1 << 0);
+                }
+                uint16_t target_keycode = (keycode == KC_BTN1) ? KC_J :
+                                         (keycode == KC_BTN2) ? KC_L :
+                                         KC_K;
                 last_keycode = target_keycode;
                 typing_timer = timer_read();
+                if (keycode == DRAG_SCROLL) return false; // DRAG_SCROLLはクリック送信しない
                 return true;
             }
         } else {
+            // キーリリース
             if (is_typing_mode && current_pressed_key != KC_NO) {
                 unregister_code16(current_pressed_key);
                 current_pressed_key = KC_NO;
+                return false;
+            }
+            if (keycode == DRAG_SCROLL) {
+                // 固定スクロールでなければ解除
+                if (!is_fixed_scroll_mode) {
+                    set_scrolling &= ~(1 << 0);
+                }
                 return false;
             }
             return true;
         }
     }
 
-    // Language switch → enter typing mode
+    // 言語切り替えキー → タイピングモードにする
     if (!is_typing_mode) {
         bool is_lng_key = false;
         if (keycode == KC_LNG1 || keycode == KC_LNG2) {
@@ -394,13 +430,37 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         }
     }
 
-    // Key release → pass through
+    // スクロールモード中の処理
+    if (get_scroll_active()) {
+        // 固定スクロール中にクリック以外のキー → スクロール解除
+        if (is_fixed_scroll_mode && record->event.pressed) {
+            is_fixed_scroll_mode = false;
+            set_scrolling &= ~(1 << 0);
+            return false;
+        }
+        // DRAG_SCROLL固定時はリリースを無視（上で処理済みだが念のため）
+        if (keycode == DRAG_SCROLL) {
+            if (!record->event.pressed && is_fixed_scroll_mode)
+                return false;
+            return false;
+        }
+        // スクロール中にBTN2 → 固定スクロールモード
+        if (keycode == KC_BTN2) {
+            if (record->event.pressed) {
+                is_fixed_scroll_mode = true;
+                set_scrolling |= (1 << 0);
+            }
+            return false;
+        }
+    }
+
+    // キーリリースはスルー
     if (!record->event.pressed) return true;
 
-    // Any alpha key → enter typing mode
+    // A-Zキー入力 → タイピングモードにする
     if (!is_typing_mode) is_typing_mode = true;
 
-    // Auto-complete consonant before vowel (for Japanese romaji input)
+    // 母音自動補完 (クリック後300ms以内に母音 → 子音を自動挿入)
     if (typing_timer != 0 && timer_elapsed(typing_timer) <= TYPING_MODE_TIMEOUT) {
         bool is_vowel = (keycode == KC_A || keycode == KC_I || keycode == KC_U || keycode == KC_E || keycode == KC_O);
         bool is_consonant = (last_keycode == KC_J || last_keycode == KC_K || last_keycode == KC_L);
